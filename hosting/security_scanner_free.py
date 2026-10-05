@@ -321,33 +321,70 @@ def get_verdict(risk_score: int,
 #  ARCHIVE SCANNER  (ZIP / tar)
 # ═══════════════════════════════════════════════════════════════
 
+def _safe_extract_archive(archive_path: str, dest: str) -> None:
+    """Safely extract ZIP/TAR archives; reject traversal and symlink entries."""
+    root = Path(dest).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+
+    def safe_target(name: str) -> Path:
+        rel = Path(name)
+        if rel.is_absolute():
+            raise ValueError(f"absolute archive path: {name}")
+        target = (root / rel).resolve()
+        if target != root and root not in target.parents:
+            raise ValueError(f"path traversal in archive: {name}")
+        return target
+
+    if archive_path.lower().endswith(".zip"):
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            for info in zf.infolist():
+                target = safe_target(info.filename)
+                mode = (info.external_attr >> 16) & 0o170000
+                if mode == 0o120000:
+                    raise ValueError(f"symlink in ZIP: {info.filename}")
+                if info.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info, "r") as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+        return
+
+    with tarfile.open(archive_path, "r:*") as tf:
+        members = tf.getmembers()
+        for member in members:
+            safe_target(member.name)
+            if member.issym() or member.islnk():
+                raise ValueError(f"link in TAR: {member.name}")
+        for member in members:
+            target = safe_target(member.name)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif member.isfile():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                src = tf.extractfile(member)
+                if src is None:
+                    raise ValueError(f"cannot read TAR member: {member.name}")
+                with src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
 def _scan_archive(file_path: str) -> Dict[str, Any]:
     tmp = tempfile.mkdtemp()
     try:
-        if file_path.endswith('.zip'):
-            with zipfile.ZipFile(file_path, 'r') as z:
-                # ZIP-slip check first
-                for name in z.namelist():
-                    if name.startswith('/') or '..' in name:
-                        return {
-                            "verdict": "DANGEROUS",
-                            "risk_score": 99,
-                            "findings": {
-                                "🔴 Zip Slip Attack": [
-                                    f"Dangerous path in ZIP: '{name}' — "
-                                    "server files overwrite ho sakte hain!"
-                                ]
-                            },
-                            "ast_findings": [],
-                            "all_threats": ["🔴 Zip Slip Attack"],
-                            "recommendation": "REJECT",
-                            "summary": "ZIP Slip attack detected!",
-                            "filename": os.path.basename(file_path),
-                        }
-                z.extractall(tmp)
-        elif file_path.lower().endswith(('.tar.gz', '.tgz', '.tar')):
-            with tarfile.open(file_path, 'r:*') as t:
-                t.extractall(tmp)
+        if file_path.lower().endswith(('.zip', '.tar.gz', '.tgz', '.tar')):
+            try:
+                _safe_extract_archive(file_path, tmp)
+            except (ValueError, OSError, zipfile.BadZipFile, tarfile.TarError) as e:
+                return {
+                    "verdict": "DANGEROUS",
+                    "risk_score": 99,
+                    "findings": {"🔴 Archive Traversal": [str(e)]},
+                    "ast_findings": [],
+                    "all_threats": ["🔴 Archive Traversal"],
+                    "recommendation": "REJECT",
+                    "summary": "Unsafe archive detected!",
+                    "filename": os.path.basename(file_path),
+                }
         else:
             return {
                 "verdict": "SUSPICIOUS", "risk_score": 20,
